@@ -1,0 +1,314 @@
+# Запуск от имени администратора и сброс PSReadLine для обхода блокировок
+Remove-Module PSReadLine -Force -ErrorAction SilentlyContinue
+
+Clear-Host
+Write-Host "==========================================================" -ForegroundColor Cyan
+Write-Host "         TICKCRAFT - АВТОМАТИЗИРОВАННАЯ ПРОВЕРКА          " -ForegroundColor Yellow
+Write-Host "==========================================================" -ForegroundColor Cyan
+
+# 1. Запрос активной папки у модератора
+$defaultPath = "$env:APPDATA\.minecraft"
+$activeInput = Read-Host "Введите путь к папке игры, из которой сейчас играет (Enter для '$defaultPath')"
+if ([string]::IsNullOrWhiteSpace($activeInput)) {
+    $currentMcPath = $defaultPath
+} else {
+    $currentMcPath = $activeInput.Trim('"').Trim("'")
+}
+
+$desktopPath = [Environment]::GetFolderPath("Desktop")
+$out = Join-Path $desktopPath "TickCraft_Full_Report.txt"
+$twinksOut = Join-Path $desktopPath "checktwinks.txt"
+
+$report = [System.Collections.Generic.List[string]]::new()
+$report.Add("==================================================================")
+$report.Add("              ОБЩИЙ ОТЧЕТ ПРОВЕРКИ НА ЧИТЫ (TickCraft)            ")
+$report.Add("==================================================================")
+$report.Add("Дата проверки : $(Get-Date -Format 'dd.MM.yyyy HH:mm:ss')")
+$report.Add("ПК / Юзер     : $env:COMPUTERNAME / $env:USERNAME")
+$report.Add("Активная папка: $currentMcPath")
+$report.Add("------------------------------------------------------------------")
+
+# Функция детального сканирования каталога
+function Scan-MinecraftDirectory($dirPath, $isPrimary = $false) {
+    $titlePrefix = if ($isPrimary) { "[АКТИВНАЯ ПАПКА ИГРОКА]" } else { "[НАЙДЕННЫЙ ЛАУНЧЕР / ПАПКА]" }
+    $report.Add("`n>>> $titlePrefix : $dirPath")
+    
+    if (-not (Test-Path $dirPath)) {
+        $report.Add("  [!] Папка не найдена или недоступна.")
+        return
+    }
+
+    # Анализ МОДОВ
+    $modsPath = Join-Path $dirPath "mods"
+    $report.Add("  --- Модификации (mods) ---")
+    if (Test-Path $modsPath) {
+        $mods = Get-ChildItem -Path $modsPath -File -ErrorAction SilentlyContinue
+        if ($mods) {
+            foreach ($m in $mods) {
+                $report.Add("    [MOD] $($m.Name) ($([math]::Round($m.Length/1KB, 2)) КБ) | Изменен: $($m.LastWriteTime.ToString('yyyy-MM-dd HH:mm'))")
+            }
+        } else {
+            $report.Add("    Папка mods пуста.")
+        }
+    } else {
+        $report.Add("    Папка mods отсутствует.")
+    }
+
+    # Анализ РЕСУРСПАКОВ
+    $rpPath = Join-Path $dirPath "resourcepacks"
+    $report.Add("  --- Ресурспаки (resourcepacks) ---")
+    if (Test-Path $rpPath) {
+        $rps = Get-ChildItem -Path $rpPath -ErrorAction SilentlyContinue
+        if ($rps) {
+            foreach ($rp in $rps) {
+                $report.Add("    [RP] $($rp.Name) | Изменен: $($rp.LastWriteTime.ToString('yyyy-MM-dd HH:mm'))")
+            }
+        } else {
+            $report.Add("    Папка resourcepacks пуста.")
+        }
+    } else {
+        $report.Add("    Папка resourcepacks отсутствует.")
+    }
+
+    # Анализ ВЕРСИЙ (.jar)
+    $verPath = Join-Path $dirPath "versions"
+    $report.Add("  --- Версии (versions) ---")
+    if (Test-Path $verPath) {
+        $vers = Get-ChildItem -Path $verPath -Directory -ErrorAction SilentlyContinue
+        if ($vers) {
+            foreach ($v in $vers) {
+                $j = Join-Path $v.FullName "$($v.Name).jar"
+                if (Test-Path $j) {
+                    $sz = [math]::Round((Get-Item $j).Length / 1KB, 2)
+                    $report.Add("    Версия: $($v.Name) | .jar: $sz КБ")
+                } else {
+                    $report.Add("    Версия: $($v.Name) (без .jar файла)")
+                }
+            }
+        } else {
+            $report.Add("    Папка versions пуста.")
+        }
+    } else {
+        $report.Add("    Папка versions отсутствует.")
+    }
+
+    # Поиск папки Baritone внутри каталога
+    $baritoneLocal = Join-Path $dirPath "baritone"
+    if (Test-Path $baritoneLocal) {
+        $report.Add("    [!] ВНИМАНИЕ: Обнаружена папка Baritone внутри $dirPath")
+    }
+}
+
+# 2. Системная информация и проверка на виртуальные машины
+$report.Add("`n[ 1. СИСТЕМНЫЕ ДАННЫЕ И ВИРТУАЛИЗАЦИЯ ]")
+$mac = (Get-NetAdapter -Physical -ea 0 | Where-Object {$_.Status -eq 'Up'} | Sort-Object -Property InterfaceIndex | Select-Object -First 1).MacAddress
+if (-not $mac) { 
+    $mac = (Get-NetAdapter -ea 0 | Where-Object {$_.Status -eq 'Up' -and $_.InterfaceDescription -notmatch 'Virtual|WireGuard|TAP'} | Sort-Object -Property InterfaceIndex | Select-Object -First 1).MacAddress 
+}
+$report.Add("1. Модель системы : $((Get-WmiObject Win32_ComputerSystem -ea 0).Model)")
+$report.Add("2. Серийный BIOS  : $((Get-WmiObject Win32_BIOS -ea 0).SerialNumber)")
+$report.Add("3. Реестр BIOS    : $((Get-ItemProperty 'HKLM:\HARDWARE\DESCRIPTION\System\BIOS' -ea 0).SystemProductName)")
+$report.Add("4. Модель диска   : $((Get-WmiObject Win32_DiskDrive -ea 0 | ForEach-Object { "$($_.Model) ($([math]::Round($_.Size/1GB, 2)) GB)" }) -join ', ')")
+$report.Add("5. Видеоадаптеры  : $(($(Get-CimInstance Win32_PnPSignedDriver -ea 0 | Where-Object {$_.DeviceClass -eq 'DISPLAY'} | ForEach-Object { "$($_.DeviceName) | $($_.Manufacturer)" }) -join '; '))")
+$vmDev = (Get-WmiObject Win32_PnPEntity -ea 0 | Where-Object {$_.Name -match 'VMware|Virtual|VBox|Hyper-V|QEMU|Xen|KVM|VirtIO|VirtualBox|VMCI|SVGA|VMBus'}).Name
+$report.Add("6. Виртуальные устр.: $(if($vmDev){$vmDev -join ', '}else{'Не обнаружены'})")
+$report.Add("7. MAC-адрес      : $mac")
+
+$bootTime = (Get-CimInstance Win32_OperatingSystem -ea 0).LastBootUpTime
+if ($bootTime) { $report.Add("Последнее включение ПК: $($bootTime.ToString('yyyy-MM-dd HH:mm:ss'))") }
+
+# 3. Службы и журналы очистки (ID 104)
+$report.Add("`n[ 2. СОСТОЯНИЕ СЛУЖБ И ОЧИСТКА ЖУРНАЛОВ ]")
+@("PcaSvc", "DPS", "SysMain", "EventLog", "bam") | ForEach-Object {
+    $s = Get-Service $_ -ea 0
+    if ($s) {
+        $t = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\$_" -n Start -ea 0).Start
+        $n = switch ($t) { 2 {'Авто'} 3 {'Вручную'} 4 {'Отключена'} default {'Неизвестно'} }
+        $report.Add("Служба: $($_.PadRight(9)) | Состояние: $($s.Status.ToString().PadRight(8)) | Запуск: $n")
+    }
+}
+$e104 = Get-WinEvent -LogName System -FilterXPath "*[System[(EventID=104)]]" -ea 0
+if ($e104) {
+    $report.Add("ВНИМАНИЕ! Обнаружены события очистки журналов (ID 104):")
+    $e104 | ForEach-Object { $report.Add(" -> $($_.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')) | $($_.Message.Split("`n")[0])") }
+} else {
+    $report.Add("События очистки журналов (ID 104) отсутствуют.")
+}
+
+# 4. Сканирование папки, указанной модератором (Этап 1)
+$report.Add("`n==================================================================")
+$report.Add("           [ЭТАП 1] ПРОВЕРКА УКАЗАННОЙ МОДЕРАТОРОМ ПАПКИ           ")
+$report.Add("==================================================================")
+Scan-MinecraftDirectory -dirPath $currentMcPath -isPrimary $true
+
+# 5. Сканирование остальных автоматически найденных лаунчеров и каталогов (Этап 2)
+$report.Add("`n==================================================================")
+$report.Add("           [ЭТАП 2] ПРОВЕРКА ОСТАЛЬНЫХ НАЙДЕННЫХ ЛАУНЧЕРОВ         ")
+$report.Add("==================================================================")
+
+$commonLauncherPaths = @(
+    "$env:APPDATA\.minecraft",
+    "$env:USERPROFILE\.minecraft",
+    "$env:APPDATA\PrismLauncher",
+    "$env:USERPROFILE\AppData\Roaming\PrismLauncher",
+    "$env:USERPROFILE\.prismlauncher",
+    "$env:USERPROFILE\.feather",
+    "$env:USERPROFILE\.lunarclient",
+    "$env:USERPROFILE\.badlion",
+    "$env:USERPROFILE\.tlauncher",
+    "$env:APPDATA\.tlauncher",
+    "$env:USERPROFILE\AppData\Local\.minecraft"
+) | Select-Object -Unique
+
+# Исключаем путь, который уже был проверен на первом этапе
+$otherPaths = $commonLauncherPaths | Where-Object { 
+    $_.TrimEnd('\').ToLower() -ne $currentMcPath.TrimEnd('\').ToLower() 
+}
+
+$foundOther = $false
+foreach ($p in $otherPaths) {
+    if (Test-Path $p) {
+        $foundOther = $true
+        Scan-MinecraftDirectory -dirPath $p -isPrimary $false
+    }
+}
+
+if (-not $foundOther) {
+    $report.Add("Дополнительных установленных лаунчеров и каталогов не обнаружено.")
+}
+
+# 6. Поиск признаков и папок читов по всей системе
+$report.Add("`n[ 5. ПОИСК ПАПОК И КОНФИГУРАЦИЙ ЧИТ-КЛИЕНТОВ ]")
+$cheatSignatures = @(
+    "baritone", "nursultan", "celestial", "expensive", "neverhook", 
+    "akrien", "deadcode", "liquidbounce", "wurst", "meteor", 
+    "wild", "thunderhack", "wexside", "doomsday", "vape", "rich", 
+    "zamorozka", "bleachhack", "future", "rusherhack", "infinity", 
+    "ares", "sigma", "inertiaclient", "faker", "catlavan", "flueger"
+)
+
+$detectedCheats = [System.Collections.Generic.List[string]]::new()
+$allSearchDirs = @($currentMcPath) + $commonLauncherPaths | Select-Object -Unique
+
+foreach ($dir in $allSearchDirs) {
+    if (Test-Path $dir) {
+        foreach ($sig in $cheatSignatures) {
+            $directCheat = Join-Path $dir $sig
+            if (Test-Path $directCheat) {
+                $detectedCheats.Add("Найден каталог чита: $directCheat")
+            }
+            Get-ChildItem -Path $dir -Directory -Filter "*$sig*" -Depth 2 -ea 0 | ForEach-Object {
+                $detectedCheats.Add("Обнаружена папка/конфиг чита: $($_.FullName)")
+            }
+        }
+    }
+}
+
+if ($detectedCheats.Count -gt 0) {
+    $report.Add("ВНИМАНИЕ! ОБНАРУЖЕНЫ СЛЕДЫ И ПАПКИ ЧИТОВ:")
+    $detectedCheats | Select-Object -Unique | ForEach-Object { $report.Add("  [!] $_") }
+} else {
+    $report.Add("Следов известных папок чит-клиентов не обнаружено.")
+}
+
+# 7. Проверка корзины ($RECYCLE.BIN) и последних удалений
+$report.Add("`n[ 6. ПРОВЕРКА КОРЗИНЫ И ПОСЛЕДНИХ УДАЛЕНИЙ ]")
+$drives = Get-PSDrive -PSProvider FileSystem | Where-Object {$_.Free -gt 0}
+foreach ($d in $drives) {
+    $rbPath = "$($d.Root)`$RECYCLE.BIN"
+    if (Test-Path $rbPath) {
+        $rbFolder = Get-Item $rbPath -Force -ea 0
+        $report.Add("Диск $($d.Root) | Изменение корзины: $($rbFolder.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss'))")
+        
+        $deletedItems = Get-ChildItem -Path $rbPath -Recurse -Force -ea 0 | Sort-Object LastWriteTime -Descending | Select-Object -First 3
+        if ($deletedItems) {
+            foreach ($di in $deletedItems) {
+                $report.Add("   -> Файл в корзине: $($di.Name) | Изменен: $($di.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss')) | Размер: $([math]::Round($di.Length/1KB, 2)) КБ")
+            }
+        }
+    }
+}
+
+# 8. История отключения USB-накопителей
+$report.Add("`n[ 7. ИСТОРИЯ ПОСЛЕДНИХ ОТКЛЮЧЕНИЙ USB-НАКОПИТЕЛЕЙ ]")
+try {
+    $usbEvents = Get-WinEvent -FilterHashtable @{
+        LogName = 'System'
+        Id = 2003, 2101, 1003
+    } -MaxEvents 10 -ea 0
+    
+    if (-not $usbEvents) {
+        $usbEvents = Get-WinEvent -FilterHashtable @{
+            LogName = 'Microsoft-Windows-DriverFrameworks-UserMode/Operational'
+            Id = 2003, 2101
+        } -MaxEvents 5 -ea 0
+    }
+
+    if ($usbEvents) {
+        foreach ($ue in $usbEvents) {
+            $report.Add("Отключение/извлечение USB: $($ue.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')) | ID: $($ue.Id)")
+        }
+    } else {
+        $usbReg = Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Enum\USBSTOR\*\*\" -ea 0
+        if ($usbReg) {
+            $report.Add("Подключавшиеся накопители в реестре:")
+            $usbReg | Select-Object -First 3 | ForEach-Object {
+                $report.Add("   -> $($_.FriendlyName) ($($_.Mfg))")
+            }
+        } else {
+            $report.Add("Записей об отключении USB не обнаружено.")
+        }
+    }
+} catch {
+    $report.Add("Журнал событий USB пуст или недоступен.")
+}
+
+# 9. Сбор списка твинков из логов активной папки
+$report.Add("`n[ 8. СПИСОК ТВИНКОВ ИГРОКА ]")
+$r = @{}
+if (Test-Path $currentMcPath) {
+    Get-ChildItem -Path $currentMcPath -Recurse -Include *.log, *.log.gz -ea 0 | ForEach-Object {
+        try {
+            if ($_.Extension -eq '.gz') {
+                $c = [System.IO.Compression.GzipStream]::new([System.IO.File]::OpenRead($_.FullName), [System.IO.Compression.CompressionMode]::Decompress)
+                $s = [System.IO.StreamReader]::new($c)
+                while (-not $s.EndOfStream) {
+                    $l = $s.ReadLine()
+                    if ($l -match 'setting user:\s*(.+)$') { $r[$matches[1].Trim()] = 1 }
+                }
+                $s.Close()
+            } else {
+                $stream = [System.IO.File]::Open($_.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+                $reader = [System.IO.StreamReader]::new($stream)
+                while(-not $reader.EndOfStream) {
+                    $line = $reader.ReadLine()
+                    if ($line -match 'setting user:\s*(.+)$') { $r[$matches[1].Trim()] = 1 }
+                }
+                $reader.Close()
+                $stream.Close()
+            }
+        } catch {}
+    }
+}
+
+if ($r.Count -gt 0) {
+    ($r.Keys -join ' ') > $twinksOut
+    foreach ($nk in $r.Keys) { $report.Add("   - $nk") }
+} else {
+    $report.Add("   Данные о твинках не обнаружены.")
+}
+
+# Сохранение единого файла отчета
+$report | Out-File -FilePath $out -Encoding UTF8
+
+Write-Host ""
+Write-Host "==========================================================" -ForegroundColor Green
+Write-Host "✓ Проверка завершена без ошибок!" -ForegroundColor Green
+Write-Host "✓ Итоговый отчет сохранен: $out" -ForegroundColor Cyan
+Write-Host "==========================================================" -ForegroundColor Green
+
+# Запуск сайта HolyCheck
+Start-Process "https://mods.holyworld.me/mods/check"
+
+# Открытие файла отчета
+Invoke-Item "$out"
